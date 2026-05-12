@@ -4,8 +4,15 @@ from github import Github
 from groq import Groq
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import chromadb
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
+
+# ─── Embedding Model ──────────────────────────────────────────────────────────
+
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+chroma_client = chromadb.Client()
 
 # ─── Diff Parsing ────────────────────────────────────────────────────────────
 
@@ -45,6 +52,62 @@ def get_pr_diff(repo_name, pr_number):
         "files": files
     }
 
+# ─── RAG: Index Repo ─────────────────────────────────────────────────────────
+
+def index_repo(repo_name: str, changed_filenames: list) -> chromadb.Collection:
+    g = Github(os.getenv("GITHUB_TOKEN"))
+    repo = g.get_repo(repo_name)
+    collection = chroma_client.get_or_create_collection("repo_context")
+
+    # always pull README and CONTRIBUTING if they exist
+    priority_files = ["README.md", "CONTRIBUTING.md", ".github/CONTRIBUTING.md"]
+    contents = repo.get_contents("")
+    all_files = []
+
+    # flatten repo file list
+    while contents:
+        item = contents.pop(0)
+        if item.type == "dir":
+            try:
+                contents.extend(repo.get_contents(item.path))
+            except:
+                pass
+        else:
+            all_files.append(item.path)
+
+    # pick related files: priority + files in same directories as changed files
+    changed_dirs = set(os.path.dirname(f) for f in changed_filenames)
+    relevant = set(priority_files)
+    for f in all_files:
+        if os.path.dirname(f) in changed_dirs:
+            relevant.add(f)
+
+    # embed and store
+    for filepath in relevant:
+        try:
+            file_content = repo.get_contents(filepath)
+            text = file_content.decoded_content.decode("utf-8", errors="ignore")[:3000]
+            embedding = embedder.encode(text).tolist()
+            collection.upsert(
+                ids=[filepath],
+                embeddings=[embedding],
+                documents=[text],
+                metadatas=[{"filepath": filepath}]
+            )
+        except:
+            pass
+
+    return collection
+
+def retrieve_context(collection: chromadb.Collection, query: str, n=3) -> str:
+    query_embedding = embedder.encode(query).tolist()
+    results = collection.query(query_embeddings=[query_embedding], n_results=n)
+    context = ""
+    for i, doc in enumerate(results["documents"][0]):
+        filepath = results["metadatas"][0][i]["filepath"]
+        context += f"\n--- {filepath} ---\n{doc}\n"
+    return context
+
 # ─── Multi-Agent Reviewers ───────────────────────────────────────────────────
 
 def build_diff_summary(diff: dict) -> str:
@@ -57,13 +120,13 @@ def build_diff_summary(diff: dict) -> str:
             summary += "REMOVED:\n" + "\n".join(f["removed_lines"]) + "\n"
     return summary
 
-def run_agent(agent_name: str, system_prompt: str, diff_summary: str, pr_title: str) -> str:
+def run_agent(agent_name: str, system_prompt: str, diff_summary: str, pr_title: str, context: str) -> str:
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"PR: '{pr_title}'\n\nChanges:\n{diff_summary}"}
+            {"role": "user", "content": f"PR: '{pr_title}'\n\nRepo Context:\n{context}\n\nChanges:\n{diff_summary}"}
         ]
     )
     return f"### {agent_name}\n\n{response.choices[0].message.content}"
@@ -94,14 +157,20 @@ Format each issue as: 🔴 CRITICAL: <file>:<line> - <issue>
 If nothing to report, say '✅ No security issues found.'"""
 }
 
-def review_diff(diff: dict) -> str:
+def review_diff(diff: dict, repo_name: str) -> str:
     diff_summary = build_diff_summary(diff)
     pr_title = diff["title"]
-    results = {}
+    changed_filenames = [f["filename"] for f in diff["files"]]
 
+    print("Indexing repo for RAG context...")
+    collection = index_repo(repo_name, changed_filenames)
+    context = retrieve_context(collection, diff_summary[:500])
+    print(f"Retrieved context from {len(context.splitlines())} lines")
+
+    results = {}
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
-            executor.submit(run_agent, name, prompt, diff_summary, pr_title): name
+            executor.submit(run_agent, name, prompt, diff_summary, pr_title, context): name
             for name, prompt in AGENTS.items()
         }
         for future in as_completed(futures):
@@ -159,9 +228,7 @@ def post_comment(repo_name, pr_number, review, score):
     g = Github(os.getenv("GITHUB_TOKEN"))
     repo = g.get_repo(repo_name)
     pr = repo.get_pull(pr_number)
-
     score_emoji = "🟢" if score["risk_score"] >= 80 else "🟡" if score["risk_score"] >= 50 else "🔴"
-
     header = f"""## 🤖 AI PR Review
 
 {score_emoji} **Risk Score: {score['risk_score']}/100** &nbsp;|&nbsp; 🔴 {score['critical']} Critical &nbsp;|&nbsp; 🟡 {score['suggestions']} Suggestions &nbsp;|&nbsp; 🔵 {score['nitpicks']} Nitpicks
@@ -178,7 +245,7 @@ if __name__ == "__main__":
     pr_number = int(os.getenv("PR_NUMBER"))
     print(f"Reviewing PR #{pr_number} in {repo_name}")
     diff = get_pr_diff(repo_name, pr_number)
-    review = review_diff(diff)
+    review = review_diff(diff, repo_name)
     score = compute_score(review)
     save_review(repo_name, pr_number, diff["title"], review, score)
     post_comment(repo_name, pr_number, review, score)
