@@ -1,5 +1,7 @@
 import os
 import sqlite3
+import subprocess
+import tempfile
 from github import Github
 from groq import Groq
 from dotenv import load_dotenv
@@ -13,6 +15,42 @@ load_dotenv()
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 chroma_client = chromadb.Client()
+
+# ─── Tool Calls ───────────────────────────────────────────────────────────────
+
+def run_flake8(files: dict) -> str:
+    results = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for filename, content in files.items():
+            if not filename.endswith(".py"):
+                continue
+            filepath = os.path.join(tmpdir, os.path.basename(filename))
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
+            result = subprocess.run(
+                ["flake8", "--max-line-length=100", filepath],
+                capture_output=True, text=True
+            )
+            if result.stdout:
+                results.append(result.stdout.replace(filepath, filename))
+    return "\n".join(results) if results else "✅ flake8: No style issues found."
+
+def run_bandit(files: dict) -> str:
+    results = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for filename, content in files.items():
+            if not filename.endswith(".py"):
+                continue
+            filepath = os.path.join(tmpdir, os.path.basename(filename))
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
+            result = subprocess.run(
+                ["bandit", "-r", filepath, "-f", "txt", "--quiet"],
+                capture_output=True, text=True
+            )
+            if result.stdout:
+                results.append(result.stdout.replace(filepath, filename))
+    return "\n".join(results) if results else "✅ bandit: No security issues found."
 
 # ─── Diff Parsing ────────────────────────────────────────────────────────────
 
@@ -34,8 +72,10 @@ def get_pr_diff(repo_name, pr_number):
     repo = g.get_repo(repo_name)
     pr = repo.get_pull(pr_number)
     files = []
+    added_contents = {}
     for f in pr.get_files():
         parsed = parse_diff(f.patch or "")
+        added_contents[f.filename] = "\n".join(parsed["added"])
         files.append({
             "filename": f.filename,
             "status": f.status,
@@ -49,22 +89,19 @@ def get_pr_diff(repo_name, pr_number):
     return {
         "title": pr.title,
         "body": pr.body,
-        "files": files
+        "files": files,
+        "added_contents": added_contents
     }
 
-# ─── RAG: Index Repo ─────────────────────────────────────────────────────────
+# ─── RAG ─────────────────────────────────────────────────────────────────────
 
 def index_repo(repo_name: str, changed_filenames: list) -> chromadb.Collection:
     g = Github(os.getenv("GITHUB_TOKEN"))
     repo = g.get_repo(repo_name)
     collection = chroma_client.get_or_create_collection("repo_context")
-
-    # always pull README and CONTRIBUTING if they exist
     priority_files = ["README.md", "CONTRIBUTING.md", ".github/CONTRIBUTING.md"]
-    contents = repo.get_contents("")
+    contents = list(repo.get_contents(""))
     all_files = []
-
-    # flatten repo file list
     while contents:
         item = contents.pop(0)
         if item.type == "dir":
@@ -74,15 +111,11 @@ def index_repo(repo_name: str, changed_filenames: list) -> chromadb.Collection:
                 pass
         else:
             all_files.append(item.path)
-
-    # pick related files: priority + files in same directories as changed files
     changed_dirs = set(os.path.dirname(f) for f in changed_filenames)
     relevant = set(priority_files)
     for f in all_files:
         if os.path.dirname(f) in changed_dirs:
             relevant.add(f)
-
-    # embed and store
     for filepath in relevant:
         try:
             file_content = repo.get_contents(filepath)
@@ -96,7 +129,6 @@ def index_repo(repo_name: str, changed_filenames: list) -> chromadb.Collection:
             )
         except:
             pass
-
     return collection
 
 def retrieve_context(collection: chromadb.Collection, query: str, n=3) -> str:
@@ -108,7 +140,7 @@ def retrieve_context(collection: chromadb.Collection, query: str, n=3) -> str:
         context += f"\n--- {filepath} ---\n{doc}\n"
     return context
 
-# ─── Multi-Agent Reviewers ───────────────────────────────────────────────────
+# ─── Agents ───────────────────────────────────────────────────────────────────
 
 def build_diff_summary(diff: dict) -> str:
     summary = ""
@@ -120,67 +152,130 @@ def build_diff_summary(diff: dict) -> str:
             summary += "REMOVED:\n" + "\n".join(f["removed_lines"]) + "\n"
     return summary
 
-def run_agent(agent_name: str, system_prompt: str, diff_summary: str, pr_title: str, context: str) -> str:
+def run_style_agent(diff_summary, pr_title, context, flake8_output) -> str:
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    response = client.chat.completions.create(
+    r = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"PR: '{pr_title}'\n\nRepo Context:\n{context}\n\nChanges:\n{diff_summary}"}
+            {"role": "system", "content": """You are a code style reviewer.
+You have real flake8 output. Use it as your primary source.
+Format each issue as: 🔵 NITPICK: <file>:<line> - <issue>
+If nothing to report, say '✅ No style issues found.'"""},
+            {"role": "user", "content": f"PR: '{pr_title}'\n\nflake8:\n{flake8_output}\n\nContext:\n{context}\n\nChanges:\n{diff_summary}"}
         ]
     )
-    return f"### {agent_name}\n\n{response.choices[0].message.content}"
+    return r.choices[0].message.content
 
-AGENTS = {
-    "🎨 Style & Readability": """You are a code style reviewer. Only review for:
-- Naming conventions, readability, formatting
-- Unnecessary complexity, dead code
-Format each issue as: 🔵 NITPICK: <file>:<line> - <issue>
-If nothing to report, say '✅ No style issues found.'""",
-
-    "🐛 Logic & Bugs": """You are a logic and bug reviewer. Only review for:
-- Bugs, edge cases, incorrect logic, null pointer risks
-- Off-by-one errors, missing error handling
+def run_security_agent(diff_summary, pr_title, context, bandit_output) -> str:
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    r = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": """You are a security reviewer.
+You have real bandit scanner output. Use it as your primary source.
 Format each issue as: 🔴 CRITICAL: <file>:<line> - <issue>
-If nothing to report, say '✅ No logic issues found.'""",
+If nothing to report, say '✅ No security issues found.'"""},
+            {"role": "user", "content": f"PR: '{pr_title}'\n\nbandit:\n{bandit_output}\n\nContext:\n{context}\n\nChanges:\n{diff_summary}"}
+        ]
+    )
+    return r.choices[0].message.content
 
-    "⚡ Performance": """You are a performance reviewer. Only review for:
-- Inefficient algorithms, unnecessary loops, repeated DB calls
-- Memory leaks, blocking operations
+def run_logic_agent(diff_summary, pr_title, context) -> str:
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    r = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": """You are a logic and bug reviewer.
+Only review for bugs, edge cases, incorrect logic, null pointer risks, missing error handling.
+Format each issue as: 🔴 CRITICAL: <file>:<line> - <issue>
+If nothing to report, say '✅ No logic issues found.'"""},
+            {"role": "user", "content": f"PR: '{pr_title}'\n\nContext:\n{context}\n\nChanges:\n{diff_summary}"}
+        ]
+    )
+    return r.choices[0].message.content
+
+def run_performance_agent(diff_summary, pr_title, context) -> str:
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    r = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": """You are a performance reviewer.
+Only review for inefficient algorithms, unnecessary loops, repeated DB calls, memory leaks.
 Format each issue as: 🟡 SUGGESTION: <file>:<line> - <issue>
-If nothing to report, say '✅ No performance issues found.'""",
+If nothing to report, say '✅ No performance issues found.'"""},
+            {"role": "user", "content": f"PR: '{pr_title}'\n\nContext:\n{context}\n\nChanges:\n{diff_summary}"}
+        ]
+    )
+    return r.choices[0].message.content
 
-    "🔒 Security": """You are a security reviewer. Only review for:
-- SQL injection, XSS, hardcoded secrets, insecure dependencies
-- Authentication/authorization issues, exposed sensitive data
-Format each issue as: 🔴 CRITICAL: <file>:<line> - <issue>
-If nothing to report, say '✅ No security issues found.'"""
-}
+def run_coordinator_agent(agent_outputs: dict, pr_title: str) -> str:
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    all_reviews = "\n\n".join(
+        f"=== {name} ===\n{output}"
+        for name, output in agent_outputs.items()
+    )
+    r = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": """You are a senior engineering lead coordinating a PR review.
+You have received reports from 4 specialized agents: Style, Logic, Performance, and Security.
+Your job is to:
+1. Synthesize the most important findings across all agents
+2. Identify any conflicts or overlapping concerns between agents
+3. Give a final merge recommendation
 
-def review_diff(diff: dict, repo_name: str) -> str:
+End your response with one of these three verdicts on its own line:
+✅ APPROVE - Safe to merge
+⚠️ NEEDS CHANGES - Minor issues to fix before merging
+🚫 BLOCK - Critical issues must be resolved before merging
+
+Be concise. Max 200 words."""},
+            {"role": "user", "content": f"PR: '{pr_title}'\n\nAgent Reports:\n{all_reviews}"}
+        ]
+    )
+    return r.choices[0].message.content
+
+# ─── Orchestrator ─────────────────────────────────────────────────────────────
+
+def review_diff(diff: dict, repo_name: str) -> tuple:
     diff_summary = build_diff_summary(diff)
     pr_title = diff["title"]
     changed_filenames = [f["filename"] for f in diff["files"]]
+    added_contents = diff.get("added_contents", {})
+
+    print("Running real tool checks...")
+    flake8_output = run_flake8(added_contents)
+    bandit_output = run_bandit(added_contents)
 
     print("Indexing repo for RAG context...")
     collection = index_repo(repo_name, changed_filenames)
     context = retrieve_context(collection, diff_summary[:500])
-    print(f"Retrieved context from {len(context.splitlines())} lines")
 
-    results = {}
+    print("Running 4 agents in parallel...")
+    agent_outputs = {}
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
-            executor.submit(run_agent, name, prompt, diff_summary, pr_title, context): name
-            for name, prompt in AGENTS.items()
+            executor.submit(run_style_agent, diff_summary, pr_title, context, flake8_output): "🎨 Style & Readability",
+            executor.submit(run_security_agent, diff_summary, pr_title, context, bandit_output): "🔒 Security",
+            executor.submit(run_logic_agent, diff_summary, pr_title, context): "🐛 Logic & Bugs",
+            executor.submit(run_performance_agent, diff_summary, pr_title, context): "⚡ Performance",
         }
         for future in as_completed(futures):
             name = futures[future]
             try:
-                results[name] = future.result()
+                agent_outputs[name] = future.result()
             except Exception as e:
-                results[name] = f"### {name}\n\n❌ Agent failed: {str(e)}"
+                agent_outputs[name] = f"❌ Agent failed: {str(e)}"
 
-    return "\n\n---\n\n".join(results[name] for name in AGENTS if name in results)
+    print("Running coordinator agent...")
+    coordinator_output = run_coordinator_agent(agent_outputs, pr_title)
+
+    order = ["🎨 Style & Readability", "🐛 Logic & Bugs", "⚡ Performance", "🔒 Security"]
+    detailed_review = "\n\n---\n\n".join(
+        f"### {name}\n\n{agent_outputs[name]}"
+        for name in order if name in agent_outputs
+    )
+    return detailed_review, coordinator_output
 
 # ─── Scoring ─────────────────────────────────────────────────────────────────
 
@@ -224,19 +319,30 @@ def save_review(repo_name, pr_number, pr_title, review, score):
 
 # ─── GitHub Comment ───────────────────────────────────────────────────────────
 
-def post_comment(repo_name, pr_number, review, score):
+def post_comment(repo_name, pr_number, review, coordinator, score):
     g = Github(os.getenv("GITHUB_TOKEN"))
     repo = g.get_repo(repo_name)
     pr = repo.get_pull(pr_number)
     score_emoji = "🟢" if score["risk_score"] >= 80 else "🟡" if score["risk_score"] >= 50 else "🔴"
-    header = f"""## 🤖 AI PR Review
+    comment = f"""## 🤖 AI PR Review
 
 {score_emoji} **Risk Score: {score['risk_score']}/100** &nbsp;|&nbsp; 🔴 {score['critical']} Critical &nbsp;|&nbsp; 🟡 {score['suggestions']} Suggestions &nbsp;|&nbsp; 🔵 {score['nitpicks']} Nitpicks
 
 ---
 
-"""
-    pr.create_issue_comment(header + review + "\n\n---\n*Reviewed by AI PR Reviewer · Powered by LLaMA 3.3*")
+## 🧠 Coordinator Summary
+
+{coordinator}
+
+---
+
+## 📋 Detailed Agent Reports
+
+{review}
+
+---
+*Reviewed by AI PR Reviewer · LLaMA 3.3 + flake8 + bandit*"""
+    pr.create_issue_comment(comment)
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -245,8 +351,8 @@ if __name__ == "__main__":
     pr_number = int(os.getenv("PR_NUMBER"))
     print(f"Reviewing PR #{pr_number} in {repo_name}")
     diff = get_pr_diff(repo_name, pr_number)
-    review = review_diff(diff, repo_name)
+    review, coordinator = review_diff(diff, repo_name)
     score = compute_score(review)
     save_review(repo_name, pr_number, diff["title"], review, score)
-    post_comment(repo_name, pr_number, review, score)
+    post_comment(repo_name, pr_number, review, coordinator, score)
     print(f"Review posted — Risk Score: {score['risk_score']}/100")
