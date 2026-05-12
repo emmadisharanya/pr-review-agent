@@ -21,7 +21,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: pip install PyGithub groq python-dotenv chromadb sentence-transformers
+        run: pip install PyGithub groq python-dotenv chromadb sentence-transformers flake8 bandit
 
       - name: Run PR Reviewer
         env:
