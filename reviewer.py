@@ -5,7 +5,6 @@ import tempfile
 from github import Github
 from groq import Groq
 from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import chromadb
 from sentence_transformers import SentenceTransformer
 
@@ -140,7 +139,7 @@ def retrieve_context(collection: chromadb.Collection, query: str, n=3) -> str:
         context += f"\n--- {filepath} ---\n{doc}\n"
     return context
 
-# ─── Agents ───────────────────────────────────────────────────────────────────
+# ─── Agents (Sequential) ──────────────────────────────────────────────────────
 
 def build_diff_summary(diff: dict) -> str:
     summary = ""
@@ -157,7 +156,7 @@ def run_style_agent(diff_summary, pr_title, context, flake8_output) -> str:
     r = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {"role": "system", "content": """You are a code style reviewer.
+            {"role": "system", "content": """You are a code style reviewer. You run first.
 You have real flake8 output. Use it as your primary source.
 Format each issue as: 🔵 NITPICK: <file>:<line> - <issue>
 If nothing to report, say '✅ No style issues found.'"""},
@@ -166,44 +165,49 @@ If nothing to report, say '✅ No style issues found.'"""},
     )
     return r.choices[0].message.content
 
-def run_security_agent(diff_summary, pr_title, context, bandit_output) -> str:
+def run_logic_agent(diff_summary, pr_title, context, style_findings) -> str:
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     r = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {"role": "system", "content": """You are a security reviewer.
+            {"role": "system", "content": """You are a logic and bug reviewer. You run second.
+You can see what the Style agent already found — avoid repeating those findings.
+Focus only on: bugs, edge cases, incorrect logic, null pointer risks, missing error handling.
+Format each issue as: 🔴 CRITICAL: <file>:<line> - <issue>
+If nothing to report, say '✅ No logic issues found.'"""},
+            {"role": "user", "content": f"PR: '{pr_title}'\n\nStyle Agent Found:\n{style_findings}\n\nContext:\n{context}\n\nChanges:\n{diff_summary}"}
+        ]
+    )
+    return r.choices[0].message.content
+
+def run_performance_agent(diff_summary, pr_title, context, style_findings, logic_findings) -> str:
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    r = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": """You are a performance reviewer. You run third.
+You can see what Style and Logic agents already found — avoid repeating those findings.
+If a logic bug also has performance implications, note the connection.
+Focus only on: inefficient algorithms, unnecessary loops, repeated DB calls, memory leaks.
+Format each issue as: 🟡 SUGGESTION: <file>:<line> - <issue>
+If nothing to report, say '✅ No performance issues found.'"""},
+            {"role": "user", "content": f"PR: '{pr_title}'\n\nStyle Agent Found:\n{style_findings}\n\nLogic Agent Found:\n{logic_findings}\n\nContext:\n{context}\n\nChanges:\n{diff_summary}"}
+        ]
+    )
+    return r.choices[0].message.content
+
+def run_security_agent(diff_summary, pr_title, context, bandit_output, style_findings, logic_findings, perf_findings) -> str:
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    r = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": """You are a security reviewer. You run last.
+You can see what ALL previous agents found — look for security implications in their findings.
+If a logic bug or performance issue also creates a security risk, flag it explicitly.
 You have real bandit scanner output. Use it as your primary source.
 Format each issue as: 🔴 CRITICAL: <file>:<line> - <issue>
 If nothing to report, say '✅ No security issues found.'"""},
-            {"role": "user", "content": f"PR: '{pr_title}'\n\nbandit:\n{bandit_output}\n\nContext:\n{context}\n\nChanges:\n{diff_summary}"}
-        ]
-    )
-    return r.choices[0].message.content
-
-def run_logic_agent(diff_summary, pr_title, context) -> str:
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    r = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": """You are a logic and bug reviewer.
-Only review for bugs, edge cases, incorrect logic, null pointer risks, missing error handling.
-Format each issue as: 🔴 CRITICAL: <file>:<line> - <issue>
-If nothing to report, say '✅ No logic issues found.'"""},
-            {"role": "user", "content": f"PR: '{pr_title}'\n\nContext:\n{context}\n\nChanges:\n{diff_summary}"}
-        ]
-    )
-    return r.choices[0].message.content
-
-def run_performance_agent(diff_summary, pr_title, context) -> str:
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    r = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": """You are a performance reviewer.
-Only review for inefficient algorithms, unnecessary loops, repeated DB calls, memory leaks.
-Format each issue as: 🟡 SUGGESTION: <file>:<line> - <issue>
-If nothing to report, say '✅ No performance issues found.'"""},
-            {"role": "user", "content": f"PR: '{pr_title}'\n\nContext:\n{context}\n\nChanges:\n{diff_summary}"}
+            {"role": "user", "content": f"PR: '{pr_title}'\n\nbandit:\n{bandit_output}\n\nStyle Agent Found:\n{style_findings}\n\nLogic Agent Found:\n{logic_findings}\n\nPerformance Agent Found:\n{perf_findings}\n\nContext:\n{context}\n\nChanges:\n{diff_summary}"}
         ]
     )
     return r.choices[0].message.content
@@ -221,7 +225,7 @@ def run_coordinator_agent(agent_outputs: dict, pr_title: str) -> str:
 You have received reports from 4 specialized agents: Style, Logic, Performance, and Security.
 Your job is to:
 1. Synthesize the most important findings across all agents
-2. Identify any conflicts or overlapping concerns between agents
+2. Identify any connections between findings across agents
 3. Give a final merge recommendation
 
 End your response with one of these three verdicts on its own line:
@@ -251,31 +255,34 @@ def review_diff(diff: dict, repo_name: str) -> tuple:
     collection = index_repo(repo_name, changed_filenames)
     context = retrieve_context(collection, diff_summary[:500])
 
-    print("Running 4 agents in parallel...")
-    agent_outputs = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {
-            executor.submit(run_style_agent, diff_summary, pr_title, context, flake8_output): "🎨 Style & Readability",
-            executor.submit(run_security_agent, diff_summary, pr_title, context, bandit_output): "🔒 Security",
-            executor.submit(run_logic_agent, diff_summary, pr_title, context): "🐛 Logic & Bugs",
-            executor.submit(run_performance_agent, diff_summary, pr_title, context): "⚡ Performance",
-        }
-        for future in as_completed(futures):
-            name = futures[future]
-            try:
-                agent_outputs[name] = future.result()
-            except Exception as e:
-                agent_outputs[name] = f"❌ Agent failed: {str(e)}"
+    print("  [1/4] Style agent...")
+    style_out = run_style_agent(diff_summary, pr_title, context, flake8_output)
 
-    print("Running coordinator agent...")
-    coordinator_output = run_coordinator_agent(agent_outputs, pr_title)
+    print("  [2/4] Logic agent (sees style findings)...")
+    logic_out = run_logic_agent(diff_summary, pr_title, context, style_out)
+
+    print("  [3/4] Performance agent (sees style + logic findings)...")
+    perf_out = run_performance_agent(diff_summary, pr_title, context, style_out, logic_out)
+
+    print("  [4/4] Security agent (sees all findings)...")
+    security_out = run_security_agent(diff_summary, pr_title, context, bandit_output, style_out, logic_out, perf_out)
+
+    agent_outputs = {
+        "🎨 Style & Readability": style_out,
+        "🐛 Logic & Bugs": logic_out,
+        "⚡ Performance": perf_out,
+        "🔒 Security": security_out
+    }
+
+    print("  [5/5] Coordinator agent...")
+    coordinator_out = run_coordinator_agent(agent_outputs, pr_title)
 
     order = ["🎨 Style & Readability", "🐛 Logic & Bugs", "⚡ Performance", "🔒 Security"]
     detailed_review = "\n\n---\n\n".join(
         f"### {name}\n\n{agent_outputs[name]}"
         for name in order if name in agent_outputs
     )
-    return detailed_review, coordinator_output
+    return detailed_review, coordinator_out
 
 # ─── Scoring ─────────────────────────────────────────────────────────────────
 
